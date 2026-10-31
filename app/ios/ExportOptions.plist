@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  This file is user-owned. Replace the 3 placeholders wrapped in double underscores with real values, then commit.
+
+  The PROJECT-FLUTTER-IOS-TESTFLIGHT / PROJECT-FLUTTER-IOS-TEST-TESTFLIGHT workflows use it when building the IPA with
+  xcodebuild -exportArchive -exportOptionsPlist ExportOptions.plist.
+  The workflow aborts if any placeholder is left.
+  (This comment does not spell out the placeholders, because the workflow checks that none remain after you fill in the values.)
+
+    teamID                 Apple Developer Team ID (10 characters, Membership in your developer.apple.com account)
+    provisioningProfiles   Key is the app bundle ID (e.g. com.example.app),
+                           value is the provisioning profile name (same as the GitHub Secret IOS_PROVISIONING_PROFILE_NAME)
+-->
+<plist version="1.0">
+<dict>
+  <key>method</key>
+  <string>app-store-connect</string>
+  <key>teamID</key>
+  <string>__TEAM_ID__</string>
+  <key>signingStyle</key>
+  <string>manual</string>
+  <key>signingCertificate</key>
+  <string>Apple Distribution</string>
+  <key>provisioningProfiles</key>
+  <dict>
+    <key>__BUNDLE_ID__</key>
+    <string>__PROVISIONING_PROFILE_NAME__</string>
+  </dict>
+</dict>
+</plist>

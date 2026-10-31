@@ -1,0 +1,98 @@
+# ===================================================================
+# This file is user-owned. Edit the per-mode behavior here.
+# ===================================================================
+#
+# Fastfile template for Google Play deployment.
+# The PROJECT-FLUTTER-ANDROID-PLAYSTORE-CICD workflow copies this file to android/fastlane/Fastfile
+# and then runs `bundle exec fastlane deploy_internal`.
+# project-auto-wizard does not overwrite this file if it already exists, so feel free to edit it.
+#
+# Deploy modes (passed by the workflow via the DEPLOY_MODE environment variable)
+# +---------------+------------+----------------+-----------------------------------------+
+# | DEPLOY_MODE   | track      | release_status | Behavior                                |
+# +---------------+------------+----------------+-----------------------------------------+
+# | store_only    | internal   | completed      | Upload to the internal testing track    |
+# | store_prepare | production | draft          | Upload to production as a draft         |
+# |               |            |                | (release manually in Play Console)      |
+# | store_submit  | production | completed      | Go all the way to a production review   |
+# +---------------+------------+----------------+-----------------------------------------+
+# Unknown or empty values are treated as store_only.
+#
+# Environment variables passed by the workflow
+#   PACKAGE_NAME          App package name (ANDROID_PACKAGE_NAME secrets/variables)
+#   AAB_PATH              Absolute path of the .aab to upload
+#   GOOGLE_PLAY_JSON_KEY  Path to the service account JSON key file
+#   VERSION_NAME          Version name (release name in Play Console)
+#   VERSION_CODE          Version code (matches the changelog file name)
+#   DEPLOY_MODE           Deploy mode from the table above
+#
+# The workflow writes the changelog to android/fastlane/metadata/android/ko-KR/changelogs/<VERSION_CODE>.txt,
+# and upload_to_play_store finds it by version code under metadata_path.
+
+# Look up a user-facing message in the installed catalog so it follows `language` in version.yml.
+# Finds the repo root by walking up to .github/scripts/messages.py (it reads ./version.yml from there);
+# falls back to the key when the catalog is unavailable (for example when fastlane runs on a laptop).
+def paw_msg(key, **params)
+  root = Dir.pwd
+  root = File.dirname(root) until File.exist?(File.join(root, ".github", "scripts", "messages.py")) || root == File.dirname(root)
+  out = IO.popen(["python3", File.join(root, ".github", "scripts", "messages.py"), "get", key, *params.map { |k, v| "#{k}=#{v}" }], chdir: root, err: File::NULL, &:read)
+  $?.success? && !out.to_s.strip.empty? ? out.chomp : key
+rescue StandardError
+  key
+end
+
+default_platform(:android)
+
+platform :android do
+  desc "Uploads the AAB to Google Play (DEPLOY_MODE: store_only | store_prepare | store_submit)"
+  lane :deploy_internal do
+    package_name = ENV["PACKAGE_NAME"].to_s.strip
+    if package_name.empty?
+      UI.user_error!(paw_msg("fastlane.package_name_empty"))
+    end
+
+    aab_path = ENV["AAB_PATH"].to_s.strip
+    json_key = ENV["GOOGLE_PLAY_JSON_KEY"].to_s.strip
+    version_name = ENV["VERSION_NAME"].to_s.strip
+    version_code = ENV["VERSION_CODE"].to_s.strip
+    if aab_path.empty? || json_key.empty? || version_name.empty? || version_code.empty?
+      UI.user_error!(paw_msg("fastlane.android_env_required"))
+    end
+
+    deploy_mode = ENV["DEPLOY_MODE"].to_s.strip
+    track, release_status =
+      case deploy_mode
+      when "store_prepare"
+        ["production", "draft"]
+      when "store_submit"
+        ["production", "completed"]
+      when "store_only"
+        ["internal", "completed"]
+      else
+        UI.important(paw_msg("fastlane.deploy_mode_unknown", deploy_mode: deploy_mode)) unless deploy_mode.empty?
+        ["internal", "completed"]
+      end
+
+    # The lane runs from the android/fastlane directory that holds this Fastfile, so this points to
+    # the same android/fastlane/metadata/android path where the workflow writes the changelog.
+    metadata_path = File.expand_path("metadata/android")
+    changelog_file = File.join(metadata_path, "ko-KR", "changelogs", "#{version_code}.txt")
+    UI.important(paw_msg("fastlane.changelog_missing", file: changelog_file)) unless File.exist?(changelog_file)
+
+    UI.message(paw_msg("fastlane.play_deploy", deploy_mode: deploy_mode.inspect, track: track, release_status: release_status))
+
+    upload_to_play_store(
+      package_name: package_name,
+      json_key: json_key,
+      aab: aab_path,
+      track: track,
+      release_status: release_status,
+      version_name: version_name,
+      metadata_path: metadata_path,
+      skip_upload_apk: true,
+      skip_upload_metadata: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true
+    )
+  end
+end
