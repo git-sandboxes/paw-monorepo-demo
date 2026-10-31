@@ -1,0 +1,62 @@
+{
+  "templateVersion": "1.0.3",
+  "installedAt": "2026-10-31 20:18:16",
+  "files": {
+    "PROJECT-COMMON-AI-PR-SUMMARY.yaml": {
+      "installed": "sha256:19f828de5f1c5cb9e3510c42d258fdc5aa398d0164d1f8634f4785b6abc59fb4",
+      "rendered": "sha256:19f828de5f1c5cb9e3510c42d258fdc5aa398d0164d1f8634f4785b6abc59fb4"
+    },
+    "PROJECT-COMMON-AUTO-CHANGELOG-CONTROL.yaml": {
+      "installed": "sha256:ada647768f365aabca66d903494a84a1713cc356750e90ef498be89bb53d24cd",
+      "rendered": "sha256:ada647768f365aabca66d903494a84a1713cc356750e90ef498be89bb53d24cd"
+    },
+    "PROJECT-COMMON-ISSUE-HELPER.yaml": {
+      "installed": "sha256:846a177deae41e160eccb21fa66b95a6ccb593286c526832f2662b8e6e00b262",
+      "rendered": "sha256:846a177deae41e160eccb21fa66b95a6ccb593286c526832f2662b8e6e00b262"
+    },
+    "PROJECT-COMMON-README-VERSION-UPDATE.yaml": {
+      "installed": "sha256:185917396ba090bc355065c38666a7aefca1036f9589c8c538a8bdf6a734342f",
+      "rendered": "sha256:185917396ba090bc355065c38666a7aefca1036f9589c8c538a8bdf6a734342f"
+    },
+    "PROJECT-COMMON-RELEASE-PR-MERGED.yaml": {
+      "installed": "sha256:c180fac4b6db54c0b82b759209ba79b2dff08852c48b772e0e6397ee66a99a33",
+      "rendered": "sha256:c180fac4b6db54c0b82b759209ba79b2dff08852c48b772e0e6397ee66a99a33"
+    },
+    "PROJECT-COMMON-RELEASE-PUBLISH.yaml": {
+      "installed": "sha256:963b3e0cc7e2c01ff2edcd6ee8f840fd8337f9215f61c810a4ff545767359a87",
+      "rendered": "sha256:963b3e0cc7e2c01ff2edcd6ee8f840fd8337f9215f61c810a4ff545767359a87"
+    },
+    "PROJECT-COMMON-VERSION-CONTROL.yaml": {
+      "installed": "sha256:3bf8a58bbf3911f0bbb1b4fe04dabf1584e14cfaac481c17ab4b77aa44b33a3a",
+      "rendered": "sha256:3bf8a58bbf3911f0bbb1b4fe04dabf1584e14cfaac481c17ab4b77aa44b33a3a"
+    },
+    "PROJECT-SPRING-CI.yml": {
+      "installed": "sha256:e86089fd37f1f40491c270ce85471141d770f3570178c421ede69f6c33acd21b",
+      "rendered": "sha256:e86089fd37f1f40491c270ce85471141d770f3570178c421ede69f6c33acd21b"
+    },
+    "PROJECT-FLUTTER-ANDROID-FIREBASE-CICD.yaml": {
+      "installed": "sha256:7968ad7e7236028cffe57ef08f3908ce3137f8bfb8c126327f598597e3e71937",
+      "rendered": "sha256:7968ad7e7236028cffe57ef08f3908ce3137f8bfb8c126327f598597e3e71937"
+    },
+    "PROJECT-FLUTTER-ANDROID-SELFHOSTED-CICD.yaml": {
+      "installed": "sha256:6660b13227fb4b9acb0d214d0db00e2cef7e3ba4b51380f8276b18fc58b3ca26",
+      "rendered": "sha256:6660b13227fb4b9acb0d214d0db00e2cef7e3ba4b51380f8276b18fc58b3ca26"
+    },
+    "PROJECT-FLUTTER-ANDROID-TEST-APK.yaml": {
+      "installed": "sha256:e3c0f09e13d34a51f1892149b535dac5864c389f484caf9c4d4f4ccf15ae9be3",
+      "rendered": "sha256:e3c0f09e13d34a51f1892149b535dac5864c389f484caf9c4d4f4ccf15ae9be3"
+    },
+    "PROJECT-FLUTTER-APP-BUILD-TRIGGER.yaml": {
+      "installed": "sha256:56d36819a67134086126de7671ecd2d193e2739de0d356d84a9c56c4f682d4f8",
+      "rendered": "sha256:56d36819a67134086126de7671ecd2d193e2739de0d356d84a9c56c4f682d4f8"
+    },
+    "PROJECT-FLUTTER-CI.yaml": {
+      "installed": "sha256:cd2383093bb0508cb8e9419b3fb99978a9f263e0888fded76337a0d1b6ee1bc4",
+      "rendered": "sha256:cd2383093bb0508cb8e9419b3fb99978a9f263e0888fded76337a0d1b6ee1bc4"
+    },
+    "PROJECT-REACT-CI.yaml": {
+      "installed": "sha256:d8ec0bbeddc4c81501dada8e477b131c683e08913cd40aefa575bee702096c85",
+      "rendered": "sha256:d8ec0bbeddc4c81501dada8e477b131c683e08913cd40aefa575bee702096c85"
+    }
+  }
+}

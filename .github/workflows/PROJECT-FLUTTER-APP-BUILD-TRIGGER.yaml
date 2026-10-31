@@ -1,0 +1,550 @@
+# project-auto-wizard:managed-workflow
+# Flutter test app build trigger workflow
+#
+# When a build command is posted as a comment on a PR or issue, this workflow
+# triggers the Android and iOS test app builds automatically.
+#
+# Highlights:
+# - Detects PR/issue comments: "/wizard app build / apk build / ios build" keywords (word order does not matter: "build app" works too)
+# - Triggers the build workflows through repository_dispatch events
+# - Builds a unique build number from the PR/issue number + build count (e.g. 38700, 38701...)
+# - Extracts the issue number from the branch name automatically (YYYYMMDD_#issue-number_title format)
+# - The test version is read dynamically from version.yml (production and test builds are told apart by build number)
+#
+# Usage:
+# - Comment on a PR: "/wizard app build" (builds Android + iOS)
+# - Comment on a PR: "/wizard apk build" (Android only)
+# - Comment on a PR: "/wizard ios build" (iOS only)
+# - Comment on an issue: same commands (an Issue Helper comment is required)
+# - Word order does not matter: "build app" / "build apk" / "build ios" behave the same
+# - To build a specific branch: "/wizard app build <branch-name>" (a branch name after the command builds that branch)
+#   e.g. "/wizard apk build 20260609_#12_feature" -> Android build of that branch
+#   If the branch name is omitted, the PR head or the branch in the issue's Issue Helper comment is used
+#
+# Workflows triggered:
+# - PROJECT-FLUTTER-ANDROID-TEST-APK.yaml (event_type: build-android-app)
+# - PROJECT-FLUTTER-IOS-TEST-TESTFLIGHT.yaml (event_type: build-ios-app)
+
+name: PROJECT-Flutter-App-Build-Trigger
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  trigger-builds:
+    name: Trigger build workflows
+    # Detect the /wizard app build / /wizard apk build / /wizard ios build keywords (word order does not matter)
+    if: |
+      contains(github.event.comment.body, '/wizard') &&
+      (
+        (contains(github.event.comment.body, 'build') && contains(github.event.comment.body, 'app')) ||
+        (contains(github.event.comment.body, 'apk') && contains(github.event.comment.body, 'build')) ||
+        (contains(github.event.comment.body, 'ios') && contains(github.event.comment.body, 'build'))
+      )
+    runs-on: ubuntu-latest
+
+    steps:
+      # Messages come from the default branch (issue_comment runs there); only the message catalog and version.yml are needed
+      - name: Checkout messages
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            .github/scripts/messages.py
+            version.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Load messages
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          python3 "$GITHUB_WORKSPACE/.github/scripts/messages.py" dump app_trigger. > "$RUNNER_TEMP/paw-msg.json"
+
+      - name: Add 👀 reaction to the comment
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const msg = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+            const commentId = context.payload.comment.id;
+
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: commentId,
+              content: 'eyes'
+            });
+
+            console.log(msg('app_trigger.reaction_done'));
+
+      - name: Detect build type
+        id: build_type
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const msg = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+            // Keywords are matched on the lower-cased text (case-insensitive); the branch name is captured from the original body (case preserved)
+            const comment = context.payload.comment.body.toLowerCase();
+            const rawComment = context.payload.comment.body;
+
+            let buildAndroid = false;
+            let buildIos = false;
+            let buildType = '';
+            let customBranch = '';
+            let m;
+
+            // Capture the same-line token after the command keyword as an optional branch argument
+            // (only same-line whitespace is allowed via [^\S\r\n]+ so a word on the next line is not mistaken for a branch)
+            // The branch name is extracted again from rawComment with the i flag -> uppercase branches such as Feature/MyBranch are preserved
+            //
+            // Both word orders are supported: "{type} build" (app/apk/ios build) and "build {type}" (build app, etc.).
+            // The app token is cut at a \b word boundary so apk is not mistaken for app (apk and application are excluded).
+            // apk/ios are checked before app so "apk build" does not fall into the app branch.
+            if (comment.match(/\/wizard[^\S\r\n]+apk[^\S\r\n]+build/) || comment.match(/\/wizard[^\S\r\n]+build[^\S\r\n]+apk/)) {
+              // /wizard apk build [branch] (or build apk) -> Android only
+              buildAndroid = true;
+              buildType = 'apk';
+              m = rawComment.match(/\/wizard[^\S\r\n]+apk[^\S\r\n]+build(?:[^\S\r\n]+(\S+))?/i)
+                || rawComment.match(/\/wizard[^\S\r\n]+build[^\S\r\n]+apk(?:[^\S\r\n]+(\S+))?/i);
+              customBranch = (m && m[1]) || '';
+            } else if (comment.match(/\/wizard[^\S\r\n]+ios[^\S\r\n]+build/) || comment.match(/\/wizard[^\S\r\n]+build[^\S\r\n]+ios/)) {
+              // /wizard ios build [branch] (or build ios) -> iOS only
+              buildIos = true;
+              buildType = 'ios';
+              m = rawComment.match(/\/wizard[^\S\r\n]+ios[^\S\r\n]+build(?:[^\S\r\n]+(\S+))?/i)
+                || rawComment.match(/\/wizard[^\S\r\n]+build[^\S\r\n]+ios(?:[^\S\r\n]+(\S+))?/i);
+              customBranch = (m && m[1]) || '';
+            } else if (comment.match(/\/wizard[^\S\r\n]+app\b[^\S\r\n]+build/) || comment.match(/\/wizard[^\S\r\n]+build[^\S\r\n]+app\b/)) {
+              // /wizard app build [branch] (or build app) -> Android + iOS
+              buildAndroid = true;
+              buildIos = true;
+              buildType = 'app';
+              m = rawComment.match(/\/wizard[^\S\r\n]+app\b[^\S\r\n]+build(?:[^\S\r\n]+(\S+))?/i)
+                || rawComment.match(/\/wizard[^\S\r\n]+build[^\S\r\n]+app\b(?:[^\S\r\n]+(\S+))?/i);
+              customBranch = (m && m[1]) || '';
+            }
+
+            core.setOutput('buildAndroid', buildAndroid.toString());
+            core.setOutput('buildIos', buildIos.toString());
+            core.setOutput('buildType', buildType);
+            core.setOutput('customBranch', customBranch);
+
+            console.log(msg('app_trigger.build_type', { type: buildType, android: buildAndroid, ios: buildIos }));
+            if (customBranch) {
+              console.log(msg('app_trigger.branch_from_comment', { branch: customBranch }));
+            }
+
+      - name: Resolve PR/issue info
+        id: source_info
+        uses: actions/github-script@v9
+        env:
+          CUSTOM_BRANCH: ${{ steps.build_type.outputs.customBranch }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const msg = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+            const customBranch = (process.env.CUSTOM_BRANCH || '').trim();
+            const issueNumber = context.payload.issue.number;
+            let sourceType = '';
+            let sourceNumber = '';
+            let branchName = '';
+            let headSha = '';
+            let relatedIssueNumber = '';
+
+            // 1. Check whether it is a PR first
+            try {
+              const pr = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: issueNumber
+              });
+
+              sourceType = 'PR';
+              sourceNumber = pr.data.number.toString();
+              branchName = customBranch || pr.data.head.ref;
+              headSha = pr.data.head.sha;
+
+              if (customBranch) {
+                console.log(msg('app_trigger.branch_override', { branch: customBranch, head: pr.data.head.ref }));
+              }
+
+              console.log(msg('app_trigger.pr_confirmed', { number: sourceNumber }));
+              console.log(msg('app_trigger.branch_name', { branch: branchName }));
+              console.log(msg('app_trigger.commit_sha', { sha: headSha }));
+
+              // Extract the issue number from the branch name (`<date>_#<number>_...` format)
+              const issueMatch = branchName.match(/#(\d+)/);
+              relatedIssueNumber = issueMatch ? issueMatch[1] : '';
+
+              if (relatedIssueNumber) {
+                console.log(msg('app_trigger.issue_extracted', { number: relatedIssueNumber }));
+              }
+
+            } catch (error) {
+              console.log(msg('app_trigger.not_pr'));
+
+              // 2. If it is not a PR, look for the "Issue Helper" comment on the issue
+              sourceType = 'ISSUE';
+              sourceNumber = issueNumber.toString();
+              relatedIssueNumber = issueNumber.toString();
+
+              // If the branch is given directly in the comment, skip searching for the Guide comment
+              if (customBranch) {
+                branchName = customBranch;
+                console.log(msg('app_trigger.custom_branch_used', { branch: branchName }));
+                console.log(msg('app_trigger.related_issue', { number: relatedIssueNumber }));
+
+                core.setOutput('found', 'true');
+                core.setOutput('sourceType', sourceType);
+                core.setOutput('sourceNumber', sourceNumber);
+                core.setOutput('branchName', branchName);
+                core.setOutput('headSha', headSha);
+                core.setOutput('relatedIssueNumber', relatedIssueNumber);
+                return;
+              }
+
+              try {
+                const comments = await github.rest.issues.listComments({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  per_page: 100
+                });
+
+                // Find the "Issue Helper" comment
+                const guideComment = comments.data.find(c =>
+                  c.body.includes('<!-- project-auto-wizard issue helper -->')
+                );
+
+                if (!guideComment) {
+                  console.log(msg('app_trigger.helper_missing_log'));
+                  core.setOutput('found', 'false');
+                  core.setOutput('errorMessage', msg('app_trigger.helper_missing_error'));
+                  return;
+                }
+
+                console.log(msg('app_trigger.helper_found'));
+
+                // Extract the branch name (content of the ``` block after the branch heading).
+                // The heading is matched in English and Korean (the Korean words are written as \u escapes) so comments written before a language change still parse.
+                const branchMatch = guideComment.body.match(/### (?:\uBE0C\uB79C\uCE58(?:\uBA85)?|Branch(?: name)?)\s*```\s*([\s\S]*?)\s*```/i);
+
+                if (!branchMatch) {
+                  console.log(msg('app_trigger.branch_parse_log'));
+                  core.setOutput('found', 'false');
+                  core.setOutput('errorMessage', msg('app_trigger.branch_parse_error'));
+                  return;
+                }
+
+                branchName = branchMatch[1].trim();
+                console.log(msg('app_trigger.branch_extracted', { branch: branchName }));
+                console.log(msg('app_trigger.build_info_extracted', { number: sourceNumber }));
+
+              } catch (commentError) {
+                console.log(msg('app_trigger.comments_error_log'), commentError.message);
+                core.setOutput('found', 'false');
+                core.setOutput('errorMessage', msg('app_trigger.comments_error', { error: commentError.message }));
+                return;
+              }
+            }
+
+            // Publish the results
+            core.setOutput('found', 'true');
+            core.setOutput('sourceType', sourceType);
+            core.setOutput('sourceNumber', sourceNumber);
+            core.setOutput('branchName', branchName);
+            core.setOutput('headSha', headSha);
+            core.setOutput('relatedIssueNumber', relatedIssueNumber);
+
+      - name: Post an error comment when the branch info is not found
+        if: steps.source_info.outputs.found != 'true'
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_ERRORMESSAGE: ${{ steps.source_info.outputs.errorMessage }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const msg = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+            const issueNumber = context.payload.issue.number;
+            const errorMessage = process.env.PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_ERRORMESSAGE;
+
+            const body = msg('app_trigger.trigger_failed_body', { error: errorMessage });
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: body
+            });
+
+            core.setFailed(errorMessage);
+
+      - name: Check that the branch exists
+        id: check_branch
+        if: steps.source_info.outputs.found == 'true'
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_GITHUB_RUN_ID: ${{ github.run_id }}
+          PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_BRANCHNAME: ${{ steps.source_info.outputs.branchName }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const msg = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+            const branchName = process.env.PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_BRANCHNAME;
+            const runId = process.env.PAW_IN_GITHUB_RUN_ID;
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId}`;
+
+            console.log(msg('app_trigger.branch_check_log', { branch: branchName }));
+
+            try {
+              await github.rest.repos.getBranch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                branch: branchName
+              });
+              console.log(msg('app_trigger.branch_exists_log', { branch: branchName }));
+              core.setOutput('exists', 'true');
+            } catch (error) {
+              if (error.status === 404) {
+                console.log(msg('app_trigger.branch_not_found_log', { branch: branchName }));
+                core.setOutput('exists', 'false');
+                core.setOutput('errorMessage', msg('app_trigger.branch_not_found_error', { branch: branchName }));
+              } else {
+                console.log(msg('app_trigger.branch_check_error_log', { error: error.message }));
+                core.setOutput('exists', 'false');
+                core.setOutput('errorMessage', msg('app_trigger.branch_check_error', { error: error.message }));
+              }
+            }
+
+      - name: Post an error comment when the branch does not exist
+        if: steps.source_info.outputs.found == 'true' && steps.check_branch.outputs.exists == 'false'
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_GITHUB_RUN_ID: ${{ github.run_id }}
+          PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_BRANCHNAME: ${{ steps.source_info.outputs.branchName }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const msg = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+            const issueNumber = context.payload.issue.number;
+            const branchName = process.env.PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_BRANCHNAME;
+            const runId = process.env.PAW_IN_GITHUB_RUN_ID;
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId}`;
+
+            const body = [
+              msg('app_trigger.branch_missing_title'),
+              '',
+              msg('app_trigger.table_head'),
+              '|------|-----|',
+              msg('app_trigger.row_requested_branch', { branch: branchName }),
+              msg('app_trigger.row_issue_pr', { number: issueNumber }),
+              '',
+              msg('app_trigger.hint_title'),
+              msg('app_trigger.hint_pushed'),
+              msg('app_trigger.hint_helper_branch'),
+              msg('app_trigger.hint_typo'),
+              '',
+              msg('app_trigger.workflow_log_link', { url: runUrl })
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: body
+            });
+
+            core.setFailed(msg('app_trigger.branch_not_found_fail', { branch: branchName }));
+
+      - name: Look up the build count and generate the build number
+        id: build_number_calc
+        if: steps.source_info.outputs.found == 'true' && steps.check_branch.outputs.exists == 'true'
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_STEPS_BUILD_TYPE_OUTPUTS_BUILDTYPE: ${{ steps.build_type.outputs.buildType }}
+          PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_SOURCENUMBER: ${{ steps.source_info.outputs.sourceNumber }}
+          PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_SOURCETYPE: ${{ steps.source_info.outputs.sourceType }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const msg = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+            const sourceNumber = parseInt(process.env.PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_SOURCENUMBER);
+            const sourceType = process.env.PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_SOURCETYPE;
+            const buildType = process.env.PAW_IN_STEPS_BUILD_TYPE_OUTPUTS_BUILDTYPE;
+
+            console.log(msg('app_trigger.count_lookup', { type: sourceType, number: sourceNumber }));
+            console.log(msg('app_trigger.count_build_type', { type: buildType }));
+
+            // Fetch every comment on the PR/issue
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: sourceNumber,
+              per_page: 100
+            });
+
+            // Count the builds of the matching platform for the build type
+            // Order-independent counting: includes('build') && includes('{type}') catches both "ios build" and "build ios".
+            // iOS: ios builds + app (shared) builds combined (App Store Connect requires unique build numbers across the whole app)
+            // Android: apk builds + app (shared) builds combined (same for the Play Store)
+            // App: every build command counted together
+            let buildCount = 0;
+
+            if (buildType === 'ios') {
+              // iOS build: count both ios builds and shared app builds (word order does not matter)
+              buildCount = comments.data.filter(c => {
+                const body = c.body.toLowerCase();
+                return body.includes('/wizard') && body.includes('build') && (
+                  body.includes('ios') || body.includes('app')
+                );
+              }).length;
+              console.log(msg('app_trigger.count_ios'));
+
+            } else if (buildType === 'apk') {
+              // Android build: count both apk builds and shared app builds (word order does not matter)
+              buildCount = comments.data.filter(c => {
+                const body = c.body.toLowerCase();
+                return body.includes('/wizard') && body.includes('build') && (
+                  body.includes('apk') || body.includes('app')
+                );
+              }).length;
+              console.log(msg('app_trigger.count_android'));
+
+            } else if (buildType === 'app') {
+              // Full app build: count every build command (word order does not matter)
+              buildCount = comments.data.filter(c => {
+                const body = c.body.toLowerCase();
+                return body.includes('/wizard') && body.includes('build') && (
+                  body.includes('ios') ||
+                  body.includes('apk') ||
+                  body.includes('app')
+                );
+              }).length;
+              console.log(msg('app_trigger.count_app'));
+            }
+
+            // Build number: source number + 2-digit count (38800, 38801, 38802...)
+            const buildNumber = `${sourceNumber}${String(buildCount).padStart(2, '0')}`;
+
+            console.log(msg('app_trigger.count_result', { type: sourceType, number: sourceNumber, build_type: buildType, count: buildCount }));
+            console.log(msg('app_trigger.build_number_generated', { number: buildNumber }));
+
+            core.setOutput('buildCount', buildCount.toString());
+            core.setOutput('buildNumber', buildNumber);
+
+      - name: Trigger the Android build workflow
+        if: |
+          steps.source_info.outputs.found == 'true' &&
+          steps.check_branch.outputs.exists == 'true' &&
+          steps.build_type.outputs.buildAndroid == 'true'
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_STEPS_BUILD_NUMBER_CALC_OUTPUTS_BUILDNUMBER: ${{ steps.build_number_calc.outputs.buildNumber }}
+          PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_BRANCHNAME: ${{ steps.source_info.outputs.branchName }}
+          PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_RELATEDISSUENUMBER: ${{ steps.source_info.outputs.relatedIssueNumber }}
+          PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_SOURCENUMBER: ${{ steps.source_info.outputs.sourceNumber }}
+          PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_SOURCETYPE: ${{ steps.source_info.outputs.sourceType }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const msg = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+            const sourceType = process.env.PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_SOURCETYPE;
+            const sourceNumber = process.env.PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_SOURCENUMBER;
+            const branchName = process.env.PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_BRANCHNAME;
+            const relatedIssueNumber = process.env.PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_RELATEDISSUENUMBER;
+            const buildNumber = process.env.PAW_IN_STEPS_BUILD_NUMBER_CALC_OUTPUTS_BUILDNUMBER;
+
+            console.log(msg('app_trigger.dispatch_start', { platform: 'Android' }));
+            console.log(msg('app_trigger.dispatch_source_number', { type: sourceType, number: sourceNumber }));
+            console.log(msg('app_trigger.dispatch_build_number', { number: buildNumber }));
+            console.log(msg('app_trigger.dispatch_branch', { branch: branchName }));
+            console.log(msg('app_trigger.dispatch_related_issue', { issue: relatedIssueNumber || msg('app_trigger.none') }));
+
+            await github.rest.repos.createDispatchEvent({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              event_type: 'build-android-app',
+              client_payload: {
+                pr_number: sourceNumber,
+                build_number: buildNumber,
+                branch_name: branchName,
+                issue_number: relatedIssueNumber || '',
+                triggered_by: `${sourceType.toLowerCase()}-comment`,
+                comment_id: context.payload.comment.id.toString(),
+                source_type: sourceType
+              }
+            });
+
+            console.log(msg('app_trigger.dispatch_done', { platform: 'Android' }));
+
+      - name: Trigger the iOS build workflow
+        if: |
+          steps.source_info.outputs.found == 'true' &&
+          steps.check_branch.outputs.exists == 'true' &&
+          steps.build_type.outputs.buildIos == 'true'
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_STEPS_BUILD_NUMBER_CALC_OUTPUTS_BUILDNUMBER: ${{ steps.build_number_calc.outputs.buildNumber }}
+          PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_BRANCHNAME: ${{ steps.source_info.outputs.branchName }}
+          PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_RELATEDISSUENUMBER: ${{ steps.source_info.outputs.relatedIssueNumber }}
+          PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_SOURCENUMBER: ${{ steps.source_info.outputs.sourceNumber }}
+          PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_SOURCETYPE: ${{ steps.source_info.outputs.sourceType }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const msg = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+            const sourceType = process.env.PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_SOURCETYPE;
+            const sourceNumber = process.env.PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_SOURCENUMBER;
+            const branchName = process.env.PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_BRANCHNAME;
+            const relatedIssueNumber = process.env.PAW_IN_STEPS_SOURCE_INFO_OUTPUTS_RELATEDISSUENUMBER;
+            const buildNumber = process.env.PAW_IN_STEPS_BUILD_NUMBER_CALC_OUTPUTS_BUILDNUMBER;
+
+            console.log(msg('app_trigger.dispatch_start', { platform: 'iOS' }));
+            console.log(msg('app_trigger.dispatch_source_number', { type: sourceType, number: sourceNumber }));
+            console.log(msg('app_trigger.dispatch_build_number', { number: buildNumber }));
+            console.log(msg('app_trigger.dispatch_branch', { branch: branchName }));
+            console.log(msg('app_trigger.dispatch_related_issue', { issue: relatedIssueNumber || msg('app_trigger.none') }));
+
+            await github.rest.repos.createDispatchEvent({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              event_type: 'build-ios-app',
+              client_payload: {
+                pr_number: sourceNumber,
+                build_number: buildNumber,
+                branch_name: branchName,
+                issue_number: relatedIssueNumber || '',
+                triggered_by: `${sourceType.toLowerCase()}-comment`,
+                comment_id: context.payload.comment.id.toString(),
+                source_type: sourceType
+              }
+            });
+
+            console.log(msg('app_trigger.dispatch_done', { platform: 'iOS' }));
+
+      # The trigger-complete comment was removed - the per-platform progress comments (Android/iOS) take over that role
+      - name: Log trigger completion
+        if: steps.source_info.outputs.found == 'true' && steps.check_branch.outputs.exists == 'true'
+        env:
+          PAW_BRANCH_NAME: ${{ steps.source_info.outputs.branchName }}
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          m() { python3 "$GITHUB_WORKSPACE/.github/scripts/messages.py" get "$@"; }
+          m app_trigger.done_log
+          m app_trigger.done_build_number number="${{ steps.build_number_calc.outputs.buildNumber }}"
+          m app_trigger.done_branch branch="$PAW_BRANCH_NAME"
+          m app_trigger.done_progress_note

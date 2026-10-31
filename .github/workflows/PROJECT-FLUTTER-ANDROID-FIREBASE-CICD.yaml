@@ -1,0 +1,692 @@
+# project-auto-wizard:managed-workflow
+# Flutter Android Firebase App Distribution deploy
+#
+# On a push to the main branch, builds the Android AAB and
+# deploys it to Firebase App Distribution.
+#
+# After the same build process as the PlayStore CICD (AAB + version check),
+# it uploads to Firebase App Distribution instead of the Play Store.
+#
+# Required GitHub Secrets
+#
+# Release Keystore:
+# RELEASE_KEYSTORE_BASE64: signing keystore (base64)
+# RELEASE_KEYSTORE_PASSWORD: keystore password
+# RELEASE_KEY_ALIAS: key alias
+# RELEASE_KEY_PASSWORD: key password
+#
+# Firebase:
+# FIREBASE_SERVICE_ACCOUNT_JSON_BASE64: Firebase service account JSON (base64)
+#
+# Environment settings (optional):
+# ENV_FILE or ENV: contents of the .env file (either one; ENV_FILE takes precedence)
+# GOOGLE_SERVICES_JSON (optional): Firebase google-services.json
+#
+# Note: register the Secrets above under the repository Settings → Secrets and variables → Actions.
+#    Edit FIREBASE_APP_ID and FIREBASE_TESTER_GROUP directly in the env section below.
+#
+# Project settings (edit in the env section)
+# APP_ARTIFACT_NAME       : project name
+# FLUTTER_VERSION    : Flutter SDK version (empty = latest stable)
+# JAVA_VERSION       : Java version
+# FIREBASE_APP_ID    : Firebase app ID (see the Firebase Console)
+# FIREBASE_TESTER_GROUP : Firebase tester group name
+#
+# Setup:
+# 1. Firebase Console → App Distribution → create a tester group
+# 2. Create the Firebase service account JSON (base64 encoded)
+# 3. Register FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 in GitHub Secrets
+# 4. Edit FIREBASE_APP_ID and FIREBASE_TESTER_GROUP in the env section
+
+name: PROJECT-FLUTTER-ANDROID-FIREBASE-APPDIST-CICD
+
+on:
+  push:
+    branches: ["main"]
+    paths: ['app/**']
+  workflow_dispatch:
+
+env:
+  # Project settings (edit the values below)
+  # Project name
+  APP_ARTIFACT_NAME: "paw-monorepo-demo"
+  # Flutter/Java versions
+  # Flutter SDK version - leave empty to use the latest stable channel (matches the SDK constraint of a fresh flutter create project).
+  # To pin a version, write it like "3.38.9". It must satisfy the environment.sdk range in pubspec.yaml.
+  FLUTTER_VERSION: ""
+  JAVA_VERSION: "17"
+  PROJECT_TYPE: "flutter"
+  # Flutter root path (relative to the repo root): "." for a single repo, "app" etc. for a monorepo - set automatically at install
+  FLUTTER_PROJECT_DIR: "app"
+  # How env vars are passed (dart-define | dotenv) - set automatically from the install-time choice
+  ENV_MODE: "dart-define"
+  # Firebase App Distribution settings
+  FIREBASE_APP_ID: "your-firebase-app-id"
+  FIREBASE_TESTER_GROUP: "testers"
+
+jobs:
+  prepare-build:
+    name: Environment setup and preparation
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.FLUTTER_PROJECT_DIR }}
+    # Run only when the CHANGELOG workflow succeeded
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name != 'workflow_run' }}
+
+    outputs:
+      version: ${{ steps.current_version.outputs.version }}
+      version_code: ${{ steps.current_version.outputs.version_code }}
+      project_type: ${{ steps.current_version.outputs.project_type }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: "main"
+          fetch-depth: 0
+
+      # Without the signing/upload Secrets the run would only fail well into the build, so report all missing names first and stop
+      # ENV_FILE and GOOGLE_SERVICES_JSON are optional, so they are not checked
+      - name: Pre-deploy check (Secrets)
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+          FIREBASE_SERVICE_ACCOUNT_JSON_BASE64: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 }}
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          m() { (cd "$GITHUB_WORKSPACE" && python3 .github/scripts/messages.py get "$@"); }
+          MISSING=""
+          for NAME in RELEASE_KEYSTORE_BASE64 RELEASE_KEYSTORE_PASSWORD RELEASE_KEY_ALIAS RELEASE_KEY_PASSWORD FIREBASE_SERVICE_ACCOUNT_JSON_BASE64; do
+            [ -n "${!NAME}" ] || MISSING="$MISSING $NAME"
+          done
+          FAILED=false
+          if [ -n "$MISSING" ]; then
+            echo "::error title=$(m flutter_a.precheck_missing_title)::$(m flutter_a.precheck_missing_body missing="$MISSING")"
+            FAILED=true
+          fi
+          # The target app ID is not a Secret; it is the value in this file's env section
+          if [ -z "$FIREBASE_APP_ID" ] || [ "$FIREBASE_APP_ID" = "your-firebase-app-id" ]; then
+            echo "::error title=$(m flutter_a.precheck_firebase_app_id_title)::$(m flutter_a.precheck_firebase_app_id_body)"
+            FAILED=true
+          fi
+          if [ "$FAILED" = "true" ]; then
+            exit 1
+          fi
+          m flutter_a.precheck_passed_firebase
+
+      - name: Pull latest changes
+        run: git pull origin main
+
+      - name: Prepare env file
+        env:
+          ENV_CONTENT: ${{ secrets.ENV_FILE || secrets.ENV }}
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          m() { (cd "$GITHUB_WORKSPACE" && python3 .github/scripts/messages.py get "$@"); }
+          if [ "$ENV_MODE" = "dotenv" ]; then
+            printf '%s\n' "$ENV_CONTENT" > .env
+            m wf_flutter.dotenv_created
+          elif [ -n "$ENV_CONTENT" ]; then
+            DART_DEFINE_FILE="$RUNNER_TEMP/dart-define.env"
+            printf '%s\n' "$ENV_CONTENT" > "$DART_DEFINE_FILE"
+            echo "DART_DEFINE_FILE=$DART_DEFINE_FILE" >> "$GITHUB_ENV"
+            m wf_flutter.dart_define_prepared
+          fi
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Cache Flutter dependencies
+        uses: actions/cache@v6
+        with:
+          path: ~/.pub-cache
+          key: ${{ runner.os }}-flutter-pub-${{ hashFiles(format('{0}/**/pubspec.lock', env.FLUTTER_PROJECT_DIR)) }}
+          restore-keys: ${{ runner.os }}-flutter-pub-
+
+      - name: Install dependencies
+        run: |
+          flutter pub get
+          if grep -q "build_runner" pubspec.yaml; then
+            dart run build_runner build --delete-conflicting-outputs
+          fi
+
+      - name: Get current version
+        id: current_version
+        working-directory: ${{ github.workspace }}   # version_manager.py must read the repo-root version.yml
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          m() { (cd "$GITHUB_WORKSPACE" && python3 .github/scripts/messages.py get "$@"); }
+          # Get VERSION (x.y.z format)
+          VERSION=$(python3 .github/scripts/version_manager.py get | tail -n 1)
+
+          # Get VERSION_CODE (a simple incrementing number managed in version.yml)
+          VERSION_CODE=$(python3 .github/scripts/version_manager.py get-code | tail -n 1)
+
+          # Print the result
+          echo "✅ VERSION: $VERSION"
+          echo "✅ VERSION_CODE: $VERSION_CODE"
+          m flutter_a.project_type project_type="${{ env.PROJECT_TYPE }}"
+
+          # Set GitHub outputs
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version_code=$VERSION_CODE" >> $GITHUB_OUTPUT
+          echo "project_type=${{ env.PROJECT_TYPE }}" >> $GITHUB_OUTPUT
+
+          # Also set as environment variables (used by scripts)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "VERSION_CODE=$VERSION_CODE" >> $GITHUB_ENV
+          echo "TODAY=$(date '+%Y-%m-%d')" >> $GITHUB_ENV
+          echo "TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_ENV
+          echo "PROJECT_TYPE=${{ env.PROJECT_TYPE }}" >> $GITHUB_ENV
+
+      - name: Generate release notes
+        id: release_notes
+        working-directory: ${{ github.workspace }}   # CHANGELOG.json, changelog_manager.py and final_release_notes.txt (paired with the upload) are relative to the repo root
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          m() { (cd "$GITHUB_WORKSPACE" && python3 .github/scripts/messages.py get "$@"); }
+          VERSION="${{ steps.current_version.outputs.version }}"
+
+          if [ -f "CHANGELOG.json" ]; then
+            m flutter_a.extracting_v_release_notes_changelog version="$VERSION"
+            # Generate CHANGELOG.md
+            python3 ./.github/scripts/changelog_manager.py generate-md
+
+            # Extract the release notes with changelog_manager.py export
+            python3 ./.github/scripts/changelog_manager.py export --version $VERSION --output final_release_notes.txt
+
+            if [ -s final_release_notes.txt ]; then
+              m flutter_a.release_notes_extracted
+              m flutter_a.extracted_release_notes
+              echo "----------------------------------------"
+              cat final_release_notes.txt
+              echo "----------------------------------------"
+              echo "RELEASE_NOTES_FOUND=true" >> $GITHUB_ENV
+            else
+              m flutter_a.failed_extract_release_notes
+              echo "RELEASE_NOTES_FOUND=false" >> $GITHUB_ENV
+              m flutter_a.default_release_note version="$VERSION" > final_release_notes.txt
+            fi
+          else
+            m flutter_a.changelog_json_not_found_using
+            echo "RELEASE_NOTES_FOUND=false" >> $GITHUB_ENV
+            m flutter_a.default_release_note version="$VERSION" > final_release_notes.txt
+          fi
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: final_release_notes.txt
+          retention-days: 1
+
+      # Upload the project files as an artifact
+      # .env is not included in the artifact for security; each job recreates it from secrets
+      - name: Upload project files
+        uses: actions/upload-artifact@v7
+        with:
+          name: project-files
+          path: |
+            ${{ env.FLUTTER_PROJECT_DIR }}/pubspec.yaml
+            ${{ env.FLUTTER_PROJECT_DIR }}/lib/
+            ${{ env.FLUTTER_PROJECT_DIR }}/assets/
+          retention-days: 1
+
+  build-android:
+    name: Build Android AAB
+    runs-on: ubuntu-latest
+    needs: prepare-build
+    defaults:
+      run:
+        working-directory: ${{ env.FLUTTER_PROJECT_DIR }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: "main"
+          fetch-depth: 0
+
+      - name: Pull latest changes
+        run: git pull origin main
+
+      - name: Download project files
+        uses: actions/download-artifact@v8
+        with:
+          name: project-files
+          path: ${{ env.FLUTTER_PROJECT_DIR }}
+
+      # Prepare env vars (created from secrets rather than the artifact, for security) - a .env file when ENV_MODE=dotenv, a temp file for dart-define
+      - name: Prepare env file
+        env:
+          ENV_CONTENT: ${{ secrets.ENV_FILE || secrets.ENV }}
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          m() { (cd "$GITHUB_WORKSPACE" && python3 .github/scripts/messages.py get "$@"); }
+          if [ "$ENV_MODE" = "dotenv" ]; then
+            printf '%s\n' "$ENV_CONTENT" > .env
+            m wf_flutter.dotenv_created
+          elif [ -n "$ENV_CONTENT" ]; then
+            DART_DEFINE_FILE="$RUNNER_TEMP/dart-define.env"
+            printf '%s\n' "$ENV_CONTENT" > "$DART_DEFINE_FILE"
+            echo "DART_DEFINE_FILE=$DART_DEFINE_FILE" >> "$GITHUB_ENV"
+            m wf_flutter.dart_define_prepared
+          fi
+
+      - name: Setup Release Keystore
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          m() { (cd "$GITHUB_WORKSPACE" && python3 .github/scripts/messages.py get "$@"); }
+          # An empty keystore built from an empty Secret leaves it unclear which key signed the build, or ends in a misleading error in a later step
+          MISSING=""
+          for name in RELEASE_KEYSTORE_BASE64 RELEASE_KEYSTORE_PASSWORD RELEASE_KEY_ALIAS RELEASE_KEY_PASSWORD; do
+            [ -n "${!name}" ] || MISSING="$MISSING $name"
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::$(m flutter_a.signing_secrets_empty missing="$MISSING")"
+            exit 1
+          fi
+          mkdir -p android/app/keystore
+          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 -d > android/app/keystore/key.jks
+          if [ ! -s android/app/keystore/key.jks ]; then
+            echo "::error::$(m flutter_a.keystore_decoded_empty)"
+            exit 1
+          fi
+          m flutter_a.release_keystore_created
+          ls -la android/app/keystore/
+
+      - name: Create key.properties
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          m() { (cd "$GITHUB_WORKSPACE" && python3 .github/scripts/messages.py get "$@"); }
+          cat > android/key.properties << EOF
+          storeFile=app/keystore/key.jks
+          storePassword=${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.RELEASE_KEY_ALIAS }}
+          keyPassword=${{ secrets.RELEASE_KEY_PASSWORD }}
+          EOF
+          m flutter_a.key_properties_created
+
+      # Create google-services.json (optional) - no empty file is written when the Secret is empty
+      - name: Create google-services.json
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          m() { (cd "$GITHUB_WORKSPACE" && python3 .github/scripts/messages.py get "$@"); }
+          if [ -n "$GOOGLE_SERVICES_JSON" ]; then
+            mkdir -p android/app
+            printf '%s' "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
+            m wf_flutter.google_services_created
+          else
+            m wf_flutter.google_services_skipped
+          fi
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Cache Flutter dependencies
+        uses: actions/cache@v6
+        with:
+          path: ~/.pub-cache
+          key: ${{ runner.os }}-flutter-pub-${{ hashFiles(format('{0}/**/pubspec.lock', env.FLUTTER_PROJECT_DIR)) }}
+          restore-keys: ${{ runner.os }}-flutter-pub-
+
+      - name: Install dependencies
+        run: |
+          flutter pub get
+          if grep -q "build_runner" pubspec.yaml; then
+            dart run build_runner build --delete-conflicting-outputs
+          fi
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: "temurin"
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles(format('{0}/android/**/build.gradle*', env.FLUTTER_PROJECT_DIR), format('{0}/android/**/gradle-wrapper.properties', env.FLUTTER_PROJECT_DIR)) }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Configure Android build for release
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          m() { (cd "$GITHUB_WORKSPACE" && python3 .github/scripts/messages.py get "$@"); }
+          # Add the release signing config to build.gradle.kts if it is missing
+          if ! grep -q "signingConfigs" android/app/build.gradle.kts; then
+            m flutter_a.signing_config_must_added_build
+            # Assume signing is already configured (it must be set up manually beforehand)
+          fi
+          m flutter_a.android_build_config_check_complete
+
+      # Keep pubspec.yaml in the x.y.z format as is
+      # The --build-name and --build-number flags of flutter build override pubspec.yaml
+
+      - name: Build Android App Bundle (AAB)
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          m() { (cd "$GITHUB_WORKSPACE" && python3 .github/scripts/messages.py get "$@"); }
+          VERSION_NAME="${{ needs.prepare-build.outputs.version }}"
+          VERSION_CODE="${{ needs.prepare-build.outputs.version_code }}"
+
+          echo "=========================================="
+          m flutter_a.starting_aab_build
+          echo "=========================================="
+          m flutter_a.build_version version_name="$VERSION_NAME"
+          m flutter_a.build_code version_code="$VERSION_CODE"
+
+          # Validate inputs
+          if [ -z "$VERSION_NAME" ] || [ -z "$VERSION_CODE" ]; then
+            m flutter_a.version_name_or_version_code
+            exit 1
+          fi
+
+          # Print Flutter environment info
+          m flutter_a.flutter_environment_info
+          flutter --version
+          flutter doctor -v | head -20
+
+          # Clean the build directory
+          m flutter_a.cleaning_previous_build_output
+          rm -rf build/app/outputs/bundle/release/
+          mkdir -p build/app/outputs/bundle/release/
+
+          # Flutter clean and pub get
+          m flutter_a.running_flutter_clean_reinstalling_dependencies
+          flutter clean
+          flutter pub get
+          if grep -q "build_runner" pubspec.yaml; then
+            dart run build_runner build --delete-conflicting-outputs
+          fi
+
+          # Add version info to local.properties (works around the Flutter flags being ignored)
+          m flutter_a.setting_version_info_local_properties
+
+          # Remove existing version info if local.properties exists
+          if [ -f "android/local.properties" ]; then
+            grep -v "flutter.versionName\|flutter.versionCode" android/local.properties > android/local.properties.tmp || true
+            mv android/local.properties.tmp android/local.properties
+          else
+            touch android/local.properties
+          fi
+
+          # Add version info
+          echo "flutter.versionName=$VERSION_NAME" >> android/local.properties
+          echo "flutter.versionCode=$VERSION_CODE" >> android/local.properties
+
+          m flutter_a.local_properties_updated
+          m flutter_a.version_info_version_name_version version_name="$VERSION_NAME" version_code="$VERSION_CODE"
+
+          # Gradle performance tuning
+          export GRADLE_OPTS="-Dorg.gradle.daemon=false -Dorg.gradle.parallel=true -Dorg.gradle.workers.max=4"
+          export JAVA_OPTS="-Xmx4g"
+          m flutter_a.gradle_tuning_applied
+
+          # Pass the version info to the flutter build command
+          # The --build-name and --build-number flags override the version in pubspec.yaml
+          # pubspec.yaml stays in x.y.z format; VERSION_CODE is managed automatically in version.yml
+          m flutter_a.running_flutter_build
+          m flutter_a.command_flutter_build_appbundle_release version_name="$VERSION_NAME" version_code="$VERSION_CODE"
+          m flutter_a.build_start_time cmd1="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+          flutter build appbundle \
+            --release \
+            --build-name="$VERSION_NAME" \
+            --build-number="$VERSION_CODE" \
+            --verbose \
+            ${DART_DEFINE_FILE:+--dart-define-from-file="$DART_DEFINE_FILE"}
+
+          BUILD_EXIT_CODE=$?
+
+          if [ $BUILD_EXIT_CODE -ne 0 ]; then
+            m flutter_a.flutter_build_failed_exit_code build_exit_code="$BUILD_EXIT_CODE"
+            m flutter_a.build_directory_state
+            find build/ -name "*.aab" -o -name "*.apk" 2>/dev/null || m flutter_a.aab_apk_not_found
+            exit 1
+          fi
+
+          m flutter_a.flutter_build_succeeded
+
+          # Check the build result
+          m flutter_a.checking_build_result
+          ls -lah build/app/outputs/bundle/release/
+
+          # Check that the AAB file exists
+          AAB_FILE="build/app/outputs/bundle/release/app-release.aab"
+          if [ ! -f "$AAB_FILE" ]; then
+            m flutter_a.aab_file_not_created
+            m flutter_a.full_build_directory_contents
+            find build/ -type f -name "*.aab" -o -name "*.apk" 2>/dev/null || m flutter_a.aab_apk_not_found
+            m flutter_a.outputs_directory_structure
+            find build/app/outputs/ -type f 2>/dev/null || m flutter_a.outputs_directory_does_not_exist
+            exit 1
+          fi
+
+          m flutter_a.aab_file_creation_confirmed
+          m flutter_a.aab_file_size cmd1="$(du -h "$AAB_FILE" | cut -f1)"
+          m flutter_a.aab_file_info cmd1="$(ls -lah "$AAB_FILE")"
+
+          # Download and install bundletool
+          m flutter_a.downloading_bundletool
+          BUNDLETOOL_VERSION="1.15.6"
+          BUNDLETOOL_URL="https://github.com/google/bundletool/releases/download/${BUNDLETOOL_VERSION}/bundletool-all-${BUNDLETOOL_VERSION}.jar"
+
+          m flutter_a.download_url bundletool_url="$BUNDLETOOL_URL"
+          wget -q "$BUNDLETOOL_URL" -O bundletool.jar
+
+          if [ ! -f "bundletool.jar" ]; then
+            m flutter_a.bundletool_download_failed
+            m flutter_a.retrying_fallback_url
+            wget -q "https://github.com/google/bundletool/releases/latest/download/bundletool-all-1.15.6.jar" -O bundletool.jar
+
+            if [ ! -f "bundletool.jar" ]; then
+              m flutter_a.bundletool_download_failed_completely
+              exit 1
+            fi
+          fi
+
+          m flutter_a.bundletool_downloaded
+          m flutter_a.bundletool_file_size cmd1="$(du -h bundletool.jar | cut -f1)"
+
+          # Check the Java environment
+          m flutter_a.checking_java_environment
+          java -version
+
+          # Check the actual version info inside the AAB file
+          # Verify that the VERSION_CODE passed via the Flutter CLI flags was applied correctly
+          echo "=========================================="
+          m flutter_a.verifying_version_info_inside_aab
+          echo "=========================================="
+
+          # Extract the version info from AndroidManifest.xml
+          m flutter_a.extracting_actual_version_info_aab
+          m flutter_a.command_run_java_jar_bundletool aab_file="$AAB_FILE"
+
+          MANIFEST_OUTPUT=$(java -jar bundletool.jar dump manifest --bundle="$AAB_FILE" 2>&1)
+          MANIFEST_EXIT_CODE=$?
+
+          m flutter_a.bundletool_result_exit_code manifest_exit_code="$MANIFEST_EXIT_CODE"
+          echo "$MANIFEST_OUTPUT"
+
+          if [ $MANIFEST_EXIT_CODE -eq 0 ]; then
+            m flutter_a.manifest_extracted
+
+            # Extract the actual version code and version name
+            ACTUAL_VERSION_CODE=$(echo "$MANIFEST_OUTPUT" | grep -o 'android:versionCode="[0-9]*"' | grep -o '[0-9]*' | head -1)
+            ACTUAL_VERSION_NAME=$(echo "$MANIFEST_OUTPUT" | grep -o 'android:versionName="[^"]*"' | sed 's/android:versionName="//;s/"//' | head -1)
+
+            m flutter_a.version_info_comparison
+            m flutter_a.expected_version_code version_code="$VERSION_CODE"
+            m flutter_a.actual_version_code actual_version_code="$ACTUAL_VERSION_CODE"
+            m flutter_a.expected_version_name version_name="$VERSION_NAME"
+            m flutter_a.actual_version_name actual_version_name="$ACTUAL_VERSION_NAME"
+
+            # Verify VERSION_CODE - a simple incrementing number managed in version.yml
+            if [ -z "$ACTUAL_VERSION_CODE" ]; then
+              m flutter_a.fatal_error_version_code_could
+              m flutter_a.full_manifest_contents
+              echo "$MANIFEST_OUTPUT"
+              exit 1
+            elif [ "$ACTUAL_VERSION_CODE" != "$VERSION_CODE" ]; then
+              m flutter_a.fatal_error_version_code_aab
+              m flutter_a.google_play_would_reject_version
+              echo ""
+              m flutter_a.debugging_info
+              m flutter_a.version_code_version_yml version_code="$VERSION_CODE"
+              m flutter_a.version_code_inside_aab_file actual_version_code="$ACTUAL_VERSION_CODE"
+              echo ""
+              m flutter_a.flags_passed_flutter_build_command
+              echo "   --build-name='$VERSION_NAME'"
+              echo "   --build-number='$VERSION_CODE'"
+              echo ""
+              m flutter_a.full_manifest_contents_2
+              echo "$MANIFEST_OUTPUT" | grep -E "versionCode|versionName|package"
+              exit 1
+            else
+              m flutter_a.version_code_check_passed actual_version_code="$ACTUAL_VERSION_CODE"
+            fi
+
+            # Check the version name too (warning only)
+            if [ -z "$ACTUAL_VERSION_NAME" ]; then
+              m flutter_a.warning_version_name_could_not
+            elif [ "$ACTUAL_VERSION_NAME" != "$VERSION_NAME" ]; then
+              m flutter_a.warning_version_name_differs_expected
+              m flutter_a.expected_actual version_name="$VERSION_NAME" actual_version_name="$ACTUAL_VERSION_NAME"
+            else
+              m flutter_a.version_name_check_passed actual_version_name="$ACTUAL_VERSION_NAME"
+            fi
+
+          else
+            m flutter_a.failed_extract_manifest_bundletool
+            m flutter_a.trying_verify_another_way
+
+            # Try checking directly with unzip
+            m flutter_a.trying_direct_extraction_unzip
+            UNZIP_OUTPUT=$(unzip -p "$AAB_FILE" base/manifest/AndroidManifest.xml 2>/dev/null | strings | grep -E "versionCode|versionName")
+
+            if [ -n "$UNZIP_OUTPUT" ]; then
+              m flutter_a.version_info_extracted_unzip
+              echo "$UNZIP_OUTPUT"
+            else
+              m flutter_a.direct_extraction_unzip_failed_too
+              m flutter_a.skipping_aab_verification_continuing
+            fi
+          fi
+
+          echo "=========================================="
+          m flutter_a.aab_build_verification_complete
+          m flutter_a.final_aab aab_file="$AAB_FILE"
+          m flutter_a.file_size cmd1="$(du -h "$AAB_FILE" | cut -f1)"
+          echo "=========================================="
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-aab
+          path: ${{ env.FLUTTER_PROJECT_DIR }}/build/app/outputs/bundle/release/app-release.aab
+          retention-days: 1
+
+  deploy-firebase:
+    name: Deploy to Firebase App Distribution
+    runs-on: ubuntu-latest
+    needs: [prepare-build, build-android]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: "main"
+          fetch-depth: 0
+
+      - name: Download AAB artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: android-aab
+          path: ${{ env.FLUTTER_PROJECT_DIR }}/build/app/outputs/bundle/release/
+
+      - name: Download release notes
+        uses: actions/download-artifact@v8
+        with:
+          name: release-notes
+          path: .
+
+      - name: Setup Firebase credentials file
+        env:
+          SERVICE_ACCOUNT_BASE64: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 }}
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          m() { (cd "$GITHUB_WORKSPACE" && python3 .github/scripts/messages.py get "$@"); }
+          if [ -z "$SERVICE_ACCOUNT_BASE64" ]; then
+            echo "::error::$(m flutter_a.firebase_service_account_json_base64)"
+            exit 1
+          fi
+          printf '%s' "$SERVICE_ACCOUNT_BASE64" | base64 --decode > firebase-service-account.json
+          m flutter_a.firebase_service_account_json_file
+
+      # Length limit for Firebase App Distribution release notes (safety net)
+      - name: Truncate release notes
+        run: |
+          if [ -f "final_release_notes.txt" ]; then
+            # Safety net for the Firebase App Distribution release notes length limit (4000 characters)
+            python3 ./.github/scripts/truncate_release_notes.py final_release_notes.txt 4000 char
+          fi
+
+      - name: Upload to Firebase App Distribution
+        id: firebase_upload
+        uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ env.FIREBASE_APP_ID }}
+          serviceCredentialsFile: firebase-service-account.json
+          groups: ${{ env.FIREBASE_TESTER_GROUP }}
+          file: ${{ env.FLUTTER_PROJECT_DIR }}/build/app/outputs/bundle/release/app-release.aab
+          releaseNotesFile: final_release_notes.txt
+
+      # Delete the Firebase credentials file (security)
+      - name: Cleanup Firebase credentials
+        if: always()
+        run: rm -f firebase-service-account.json
+
+      - name: Notify Firebase Upload Success
+        if: success()
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          m() { (cd "$GITHUB_WORKSPACE" && python3 .github/scripts/messages.py get "$@"); }
+          m flutter_a.firebase_app_distribution_deployment_succeeded
+          m flutter_a.version version="${{ needs.prepare-build.outputs.version }}" version_code="${{ needs.prepare-build.outputs.version_code }}"
+          m flutter_a.commit sha="${{ github.sha }}"
+          echo ""
+          m flutter_a.how_testers_check_build
+          m flutter_a.launch_firebase_app_tester_app
+          m flutter_a.select_app
+          m flutter_a.download_latest_build
+
+      - name: Notify on Failure
+        if: failure()
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          m() { (cd "$GITHUB_WORKSPACE" && python3 .github/scripts/messages.py get "$@"); }
+          m flutter_a.firebase_app_distribution_deployment_failed
+          m flutter_a.please_check_logs
